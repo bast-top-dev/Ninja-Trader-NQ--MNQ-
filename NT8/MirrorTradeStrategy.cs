@@ -1,383 +1,309 @@
-// NinjaTrader 8 Strategy: MirrorTradeStrategy
-// - Listens for executions on the main instrument (manual or otherwise) on the strategy's account
-// - Places opposite-direction managed orders on a mirror instrument with OCO SL/TP matching dollar targets
-// - Closes any pre-existing mirror position before placing a new one
-// - Displays basic status on the chart
+// ======================================================
+// MirrorTradeStrategy for NinjaTrader 8
+// Description:
+//   Mirrors trades from a main instrument to a mirror instrument
+//   in the opposite direction with adjustable SL/TP values in dollars.
+//   Designed for use cases like NQ ↔ MNQ, ES ↔ MES, etc.
+// ======================================================
 
+#region Using declarations
 using System;
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
-using NinjaTrader.NinjaScript;
+using NinjaTrader.Cbi;
 using NinjaTrader.Data;
 using NinjaTrader.Gui;
 using NinjaTrader.Gui.Chart;
-using NinjaTrader.Cbi;
+using NinjaTrader.Gui.Tools;
+using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.Strategies;
+#endregion
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
-	public class MirrorTradeStrategy : Strategy
-	{
-		// --------------------
-		// User-configurable inputs
-		// --------------------
-		[Gui.CategoryOrder("Mirror Settings", 0)]
-		[Gui.CategoryOrder("Risk Settings ($)", 1)]
-		[Gui.CategoryOrder("Control", 2)]
+    public class MirrorTradeStrategy : Strategy
+    {
+        #region === User Inputs ===
 
-		[NinjaScriptProperty]
-		[Display(Name = "Mirror Instrument (e.g., MNQ 12-25)", GroupName = "Mirror Settings", Order = 0)]
-		public string MirrorInstrumentName { get; set; } = "MNQ 12-25";
+        [NinjaScriptProperty]
+        [Display(Name = "Mirror Instrument (e.g., MNQ 12-25)", GroupName = "Mirror Settings", Order = 0)]
+        public string MirrorInstrumentName { get; set; } = "MNQ 12-25";
 
-		[NinjaScriptProperty]
-		[Display(Name = "Contract Multiplier Z", GroupName = "Mirror Settings", Order = 1, Description = "Mirror contracts = Z * main quantity.")]
-		public int ContractMultiplierZ { get; set; } = 1;
+        [NinjaScriptProperty]
+        [Display(Name = "Contract Multiplier Z", GroupName = "Mirror Settings", Order = 1)]
+        public int ContractMultiplierZ { get; set; } = 1;
 
-		[NinjaScriptProperty]
-		[Display(Name = "Main SL ($ loss)", GroupName = "Risk Settings ($)", Order = 0)]
-		public double MainStopLossDollars { get; set; } = 200;
+        [NinjaScriptProperty]
+        [Display(Name = "Main Stop Loss ($)", GroupName = "Risk Settings", Order = 0)]
+        public double MainStopLossDollars { get; set; } = 200;
 
-		[NinjaScriptProperty]
-		[Display(Name = "Main TP ($ profit)", GroupName = "Risk Settings ($)", Order = 1)]
-		public double MainTakeProfitDollars { get; set; } = 100;
+        [NinjaScriptProperty]
+        [Display(Name = "Main Take Profit ($)", GroupName = "Risk Settings", Order = 1)]
+        public double MainTakeProfitDollars { get; set; } = 100;
 
-		[NinjaScriptProperty]
-		[Display(Name = "Enable Opposite Direction", GroupName = "Control", Order = 0)]
-		public bool OppositeDirection { get; set; } = true;
+        [NinjaScriptProperty]
+        [Display(Name = "Opposite Direction", GroupName = "Mirror Settings", Order = 2)]
+        public bool OppositeDirection { get; set; } = true;
 
-		[NinjaScriptProperty]
-		[Display(Name = "Enable Strategy", GroupName = "Control", Order = 1)]
-		public bool EnableCopy { get; set; } = true;
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Copy", GroupName = "Control", Order = 3)]
+        public bool EnableCopy { get; set; } = true;
 
-		[NinjaScriptProperty]
-		[Display(Name = "Force Simulation Mode", GroupName = "Control", Order = 2, Description = "Only allow trading in simulation accounts")]
-		public bool ForceSimulationMode { get; set; } = true;
+        [NinjaScriptProperty]
+        [Display(Name = "Force Simulation Only", GroupName = "Control", Order = 4)]
+        public bool ForceSimulationMode { get; set; } = true;
 
-		// --------------------
-		// Internal state
-		// --------------------
-		private Instrument _mirrorInstrument;
-		private int _mirrorBarsInProgress = -1;
-		private string _entrySignalTag = "MirrorEntry";
-		private Account _account;
+        #endregion
 
-		// Track last mirrored entry time to rate-limit duplicates
-		private DateTime _lastMirrorActionTime = DateTime.MinValue;
-		private TimeSpan _minMirrorInterval = TimeSpan.FromSeconds(1);
+        #region === Internal Fields ===
+        private Instrument _mirrorInstrument;
+        private int _mirrorBarsInProgress = -1;
+        private string _entrySignalTag = "MirrorEntry";
+        private Account _account;
+        private Button _toggleButton;
+        private TextBlock _statusText;
+        private bool _isMainPositionOpen = false;
+        private bool _isMirrorPositionOpen = false;
+        private DateTime _lastMirrorActionTime = DateTime.MinValue;
+        private TimeSpan _minMirrorInterval = TimeSpan.FromSeconds(1);
+        #endregion
 
-		// UI Controls
-		private Button _toggleButton;
-		private TextBlock _statusText;
-		private bool _isMainPositionOpen = false;
-		private bool _isMirrorPositionOpen = false;
+        #region === Strategy Setup ===
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name = "MirrorTradeStrategy";
+                Calculate = Calculate.OnEachTick;
+                IsOverlay = true;
+                IsUnmanaged = false;
+                EntriesPerDirection = 1;
+                EntryHandling = EntryHandling.AllEntries;
+            }
+            else if (State == State.Configure)
+            {
+                if (string.IsNullOrWhiteSpace(MirrorInstrumentName))
+                    throw new ArgumentException("MirrorInstrumentName cannot be empty.");
 
-		protected override void OnStateChange()
-		{
-			if (State == State.SetDefaults)
-			{
-				Name = "MirrorTradeStrategy";
-				Calculate = Calculate.OnBarClose;
-				EntriesPerDirection = 1;
-				EntryHandling = EntryHandling.AllEntries;
-				IsUnmanaged = false; // using managed orders with multi-instrument support
-				IsOverlay = true;
-				MaximumBarsLookBack = MaximumBarsLookBack.Infinite;
-				TraceOrders = false;
-				IsInstantiatedOnEachOptimizationIteration = false;
-			}
-			else if (State == State.Configure)
-			{
-				if (string.IsNullOrWhiteSpace(MirrorInstrumentName))
-					throw new ArgumentException("MirrorInstrumentName cannot be empty.");
+                _mirrorInstrument = Instrument.GetInstrument(MirrorInstrumentName);
+                if (_mirrorInstrument == null)
+                    throw new ArgumentException($"Could not resolve mirror instrument: {MirrorInstrumentName}");
 
-				_mirrorInstrument = Instrument.GetInstrument(MirrorInstrumentName);
-				if (_mirrorInstrument == null)
-					throw new ArgumentException($"Could not resolve mirror instrument: {MirrorInstrumentName}");
+                AddDataSeries(_mirrorInstrument, BarsPeriodType.Minute, 1);
+            }
+            else if (State == State.DataLoaded)
+            {
+                for (int i = 0; i < BarsArray.Length; i++)
+                {
+                    if (BarsArray[i].Instrument == _mirrorInstrument)
+                    {
+                        _mirrorBarsInProgress = i;
+                        break;
+                    }
+                }
+            }
+            else if (State == State.Realtime)
+            {
+                if (ForceSimulationMode && Account != null && !Account.IsSimulationAccount)
+                {
+                    Print("[MirrorTradeStrategy] Live account detected. Disabled due to ForceSimulationMode.");
+                    EnableCopy = false;
+                    ShowAlert("Safety", "Live account disabled (Sim only mode).", Brushes.Red, Brushes.White);
+                    return;
+                }
 
-				// Add mirror instrument as secondary series to route managed orders
-				AddDataSeries(_mirrorInstrument, BarsPeriod.BarsPeriodType, BarsPeriod.Value);
-			}
-			else if (State == State.DataLoaded)
-			{
-				// Identify BarsInProgress index for mirror series
-				for (int i = 0; i < BarsArray.Length; i++)
-				{
-					if (BarsArray[i].Instrument == _mirrorInstrument)
-					{
-						_mirrorBarsInProgress = i;
-						break;
-					}
-				}
+                _account = Account;
+                _account.ExecutionUpdate += OnAccountExecutionUpdate;
 
-				if (_mirrorBarsInProgress < 0)
-					throw new Exception("Mirror BarsInProgress index not found after AddDataSeries.");
-			}
-			else if (State == State.Realtime)
-			{
-				// Safety check: Force simulation mode if enabled
-				if (ForceSimulationMode && Account != null && !Account.IsSimulationAccount)
-				{
-					Print($"[MirrorTradeStrategy] SAFETY: Force Simulation Mode is enabled but account is LIVE. Strategy disabled.");
-					EnableCopy = false;
-					Alert("SAFETY ALERT", "Strategy disabled - Force Simulation Mode enabled but account is LIVE!", AlertPriority.High);
-					return;
-				}
+                CreateChartControls();
+                Print($"[MirrorTradeStrategy] Started on {Account.Name}. Mirror: {_mirrorInstrument.FullName}");
+            }
+            else if (State == State.Terminated)
+            {
+                if (_account != null)
+                    _account.ExecutionUpdate -= OnAccountExecutionUpdate;
 
-				// Subscribe to account-level execution events to capture manual trades on the main instrument
-				_account = Account;
-				if (_account != null)
-				{
-					_account.ExecutionUpdate += OnAccountExecutionUpdate;
-					Print($"[MirrorTradeStrategy] Started on account: {_account.Name} (Simulation: {_account.IsSimulationAccount})");
-				}
+                if (ChartControl != null)
+                {
+                    try { ChartControl.Dispatcher.InvokeAsync(() => ChartControl.CustomControls.Clear()); }
+                    catch { }
+                }
+            }
+        }
+        #endregion
 
-				// Create UI controls
-				CreateChartControls();
-			}
-			else if (State == State.Terminated)
-			{
-				if (_account != null)
-				{
-					_account.ExecutionUpdate -= OnAccountExecutionUpdate;
-					_account = null;
-				}
-			}
-		}
+        #region === Core Logic ===
 
-		protected override void OnBarUpdate()
-		{
-			// Update position tracking and check for desync
-			if (CurrentBars[0] < 1)
-				return;
+        protected override void OnBarUpdate()
+        {
+            if (BarsInProgress != 0 || CurrentBars[0] < 1)
+                return;
 
-			if (BarsInProgress == 0)
-			{
-				var mainPos = Position;
-				var mirrorPos = Positions[_mirrorBarsInProgress];
-				
-				// Track position states
-				bool wasMainOpen = _isMainPositionOpen;
-				bool wasMirrorOpen = _isMirrorPositionOpen;
-				
-				_isMainPositionOpen = (mainPos.MarketPosition != MarketPosition.Flat);
-				_isMirrorPositionOpen = (mirrorPos.MarketPosition != MarketPosition.Flat);
-				
-				// Check for desync alerts
-				CheckForDesyncAlerts(wasMainOpen, wasMirrorOpen);
-				
-				// Update UI status
-				UpdateStatusDisplay(mainPos, mirrorPos);
-			}
-		}
+            var mainPos = Position;
+            var mirrorPos = Account?.Positions?.FirstOrDefault(p => p.Instrument == _mirrorInstrument);
 
-		private void OnAccountExecutionUpdate(object sender, ExecutionEventArgs e)
-		{
-			try
-			{
-				if (!EnableCopy)
-					return;
+            bool wasMain = _isMainPositionOpen;
+            bool wasMirror = _isMirrorPositionOpen;
 
-				// Only mirror executions on our main instrument and account
-				if (e == null || e.Execution == null || e.Execution.Instrument == null)
-					return;
+            _isMainPositionOpen = (mainPos.MarketPosition != MarketPosition.Flat);
+            _isMirrorPositionOpen = (mirrorPos != null && mirrorPos.MarketPosition != MarketPosition.Flat);
 
-				// Ignore our own mirror instrument executions to avoid recursion
-				if (e.Execution.Instrument.MasterInstrument.Name == _mirrorInstrument.MasterInstrument.Name)
-					return;
+            if (wasMain && !_isMainPositionOpen && _isMirrorPositionOpen)
+                ShowAlert("Desync", "Main closed but Mirror still open!", Brushes.Yellow, Brushes.Black);
+            if (wasMirror && !_isMirrorPositionOpen && _isMainPositionOpen)
+                ShowAlert("Desync", "Mirror closed but Main still open!", Brushes.Yellow, Brushes.Black);
 
-				// Only respond to executions on the strategy's primary instrument
-				if (e.Execution.Instrument.MasterInstrument.Name != Instrument.MasterInstrument.Name)
-					return;
+            UpdateStatusDisplay(mainPos, mirrorPos);
+        }
 
-				// Filled executions only
-				if (e.Order == null || e.Order.OrderState != OrderState.Filled)
-					return;
+        private void OnAccountExecutionUpdate(object sender, ExecutionEventArgs args)
+        {
+            try
+            {
+                if (!EnableCopy || args == null || args.Execution == null)
+                    return;
 
-				// Rate-limit duplicate triggers from partial fills
-				if (DateTime.UtcNow - _lastMirrorActionTime < _minMirrorInterval)
-					return;
+                if (args.Execution.Instrument == null || args.Execution.Instrument.MasterInstrument.Name != Instrument.MasterInstrument.Name)
+                    return; // Only mirror main instrument
 
-				_lastMirrorActionTime = DateTime.UtcNow;
+                if (args.Order == null || args.Order.OrderState != OrderState.Filled)
+                    return;
 
-				// Determine mirror side and quantity
-				int mainFilledQty = Math.Abs(e.Execution.Quantity);
-				int mirrorQty = Math.Max(1, ContractMultiplierZ * mainFilledQty);
+                if (DateTime.UtcNow - _lastMirrorActionTime < _minMirrorInterval)
+                    return;
+                _lastMirrorActionTime = DateTime.UtcNow;
 
-				OrderAction mirrorAction;
-				if (OppositeDirection)
-				{
-					mirrorAction = (e.Execution.MarketPosition == MarketPosition.Long) ? OrderAction.SellShort : OrderAction.Buy;
-				}
-				else
-				{
-					mirrorAction = (e.Execution.MarketPosition == MarketPosition.Long) ? OrderAction.Buy : OrderAction.SellShort;
-				}
+                int mainQty = Math.Abs(args.Execution.Quantity);
+                int mirrorQty = Math.Max(1, ContractMultiplierZ * mainQty);
 
-				// Close any existing mirror position first
-				var mirrorPosition = Positions[_mirrorBarsInProgress];
-				if (mirrorPosition != null && mirrorPosition.MarketPosition != MarketPosition.Flat)
-				{
-					int qtyToClose = Math.Abs(mirrorPosition.Quantity);
-					if (qtyToClose > 0)
-					{
-						if (mirrorPosition.MarketPosition == MarketPosition.Long)
-							ExitLong(_mirrorBarsInProgress, qtyToClose, "", "");
-						else if (mirrorPosition.MarketPosition == MarketPosition.Short)
-							ExitShort(_mirrorBarsInProgress, qtyToClose, "", "");
-					}
-				}
+                OrderAction mirrorAction = OppositeDirection
+                    ? (args.Execution.MarketPosition == MarketPosition.Long ? OrderAction.SellShort : OrderAction.Buy)
+                    : (args.Execution.MarketPosition == MarketPosition.Long ? OrderAction.Buy : OrderAction.SellShort);
 
-				// Calculate SL/TP in ticks for mirror
-				var tickValueMirror = _mirrorInstrument.MasterInstrument.PointValue * _mirrorInstrument.MasterInstrument.TickSize;
-				if (tickValueMirror <= 0)
-					return;
+                // Close existing mirror position
+                var mirrorPosition = Account.Positions.FirstOrDefault(p => p.Instrument == _mirrorInstrument);
+                if (mirrorPosition != null && mirrorPosition.MarketPosition != MarketPosition.Flat)
+                {
+                    int qtyToClose = Math.Abs(mirrorPosition.Quantity);
+                    if (mirrorPosition.MarketPosition == MarketPosition.Long)
+                        ExitLong(_mirrorBarsInProgress, qtyToClose, "", "");
+                    else
+                        ExitShort(_mirrorBarsInProgress, qtyToClose, "", "");
+                }
 
-				int tpTicks = DollarsToTicks(MainTakeProfitDollars, tickValueMirror, mirrorQty);
-				int slTicks = DollarsToTicks(MainStopLossDollars, tickValueMirror, mirrorQty);
+                // Tick calculations
+                double tickValueMirror = _mirrorInstrument.MasterInstrument.PointValue * _mirrorInstrument.MasterInstrument.TickSize;
+                int tpTicks = DollarsToTicks(MainTakeProfitDollars, tickValueMirror, mirrorQty);
+                int slTicks = DollarsToTicks(MainStopLossDollars, tickValueMirror, mirrorQty);
 
-				// Attach OCO-style managed orders via Set methods bound to the entry signal
-				string entrySignal = _entrySignalTag + ":" + Guid.NewGuid().ToString("N").Substring(0, 8);
-				SetStopLoss(_mirrorBarsInProgress, entrySignal, CalculationMode.Ticks, slTicks, false);
-				SetProfitTarget(_mirrorBarsInProgress, entrySignal, CalculationMode.Ticks, tpTicks);
+                string signal = _entrySignalTag + Guid.NewGuid().ToString("N").Substring(0, 6);
+                SetStopLoss(_mirrorBarsInProgress, signal, CalculationMode.Ticks, slTicks, false);
+                SetProfitTarget(_mirrorBarsInProgress, signal, CalculationMode.Ticks, tpTicks);
 
-				// Submit the mirror entry managed order
-				if (mirrorAction == OrderAction.Buy)
-					EnterLong(_mirrorBarsInProgress, mirrorQty, entrySignal);
-				else if (mirrorAction == OrderAction.SellShort)
-					EnterShort(_mirrorBarsInProgress, mirrorQty, entrySignal);
-			}
-			catch (Exception ex)
-			{
-				Print($"[MirrorTradeStrategy] Error in OnAccountExecutionUpdate: {ex.Message}");
-			}
-		}
+                if (mirrorAction == OrderAction.Buy)
+                    EnterLong(_mirrorBarsInProgress, mirrorQty, signal);
+                else
+                    EnterShort(_mirrorBarsInProgress, mirrorQty, signal);
 
-		private int DollarsToTicks(double dollars, double tickValue, int quantity)
-		{
-			if (dollars <= 0 || tickValue <= 0 || quantity <= 0)
-				return 0;
-			double ticksExact = dollars / (tickValue * quantity);
-			int ticks = Math.Max(1, (int)Math.Round(ticksExact, MidpointRounding.AwayFromZero));
-			return ticks;
-		}
+                Print($"[MirrorTradeStrategy] {mirrorAction} {mirrorQty} {_mirrorInstrument.MasterInstrument.Name} | SL={slTicks} ticks | TP={tpTicks} ticks");
+            }
+            catch (Exception ex)
+            {
+                Print($"[MirrorTradeStrategy] Error: {ex.Message}");
+            }
+        }
 
-		private void CreateChartControls()
-		{
-			try
-			{
-				// Create toggle button
-				_toggleButton = new Button
-				{
-					Content = EnableCopy ? "DISABLE MIRROR" : "ENABLE MIRROR",
-					Width = 120,
-					Height = 30,
-					Background = EnableCopy ? Brushes.Red : Brushes.Green,
-					Foreground = Brushes.White,
-					FontWeight = FontWeights.Bold
-				};
-				_toggleButton.Click += ToggleButton_Click;
+        private int DollarsToTicks(double dollars, double tickValue, int qty)
+        {
+            if (tickValue <= 0 || qty <= 0) return 0;
+            double ticks = dollars / (tickValue * qty);
+            return Math.Max(1, (int)Math.Round(ticks, MidpointRounding.AwayFromZero));
+        }
 
-				// Create status text
-				_statusText = new TextBlock
-				{
-					Foreground = Brushes.White,
-					FontSize = 12,
-					FontFamily = new FontFamily("Arial"),
-					Margin = new Thickness(5)
-				};
+        #endregion
 
-				// Add controls to chart
-				if (ChartControl != null)
-				{
-					ChartControl.Dispatcher.InvokeAsync(() =>
-					{
-						var panel = new StackPanel
-						{
-							Orientation = Orientation.Vertical,
-							Background = new SolidColorBrush(Color.FromArgb(150, 0, 0, 0)),
-							Margin = new Thickness(10)
-						};
-						panel.Children.Add(_toggleButton);
-						panel.Children.Add(_statusText);
-						
-						ChartControl.CustomControls.Add(panel);
-					});
-				}
-			}
-			catch (Exception ex)
-			{
-				Print($"[MirrorTradeStrategy] Error creating chart controls: {ex.Message}");
-			}
-		}
+        #region === UI / Display ===
 
-		private void ToggleButton_Click(object sender, RoutedEventArgs e)
-		{
-			try
-			{
-				EnableCopy = !EnableCopy;
-				_toggleButton.Content = EnableCopy ? "DISABLE MIRROR" : "ENABLE MIRROR";
-				_toggleButton.Background = EnableCopy ? Brushes.Red : Brushes.Green;
-				
-				Print($"[MirrorTradeStrategy] Mirror copying {(EnableCopy ? "ENABLED" : "DISABLED")}");
-			}
-			catch (Exception ex)
-			{
-				Print($"[MirrorTradeStrategy] Error toggling mirror: {ex.Message}");
-			}
-		}
+        private void CreateChartControls()
+        {
+            try
+            {
+                _toggleButton = new Button
+                {
+                    Content = EnableCopy ? "DISABLE MIRROR" : "ENABLE MIRROR",
+                    Width = 130,
+                    Height = 30,
+                    Background = EnableCopy ? Brushes.Red : Brushes.Green,
+                    Foreground = Brushes.White,
+                    FontWeight = FontWeights.Bold
+                };
+                _toggleButton.Click += ToggleButton_Click;
 
-		private void CheckForDesyncAlerts(bool wasMainOpen, bool wasMirrorOpen)
-		{
-			try
-			{
-				// Alert if main position closed while mirror is still open
-				if (wasMainOpen && !_isMainPositionOpen && _isMirrorPositionOpen)
-				{
-					Alert("DESYNC ALERT", $"Main {Instrument.FullName} position closed, but Mirror {_mirrorInstrument.FullName} position still open!", AlertPriority.High);
-					Print($"[MirrorTradeStrategy] DESYNC: Main position closed, Mirror position still open");
-				}
-				
-				// Alert if mirror position closed while main is still open
-				if (wasMirrorOpen && !_isMirrorPositionOpen && _isMainPositionOpen)
-				{
-					Alert("DESYNC ALERT", $"Mirror {_mirrorInstrument.FullName} position closed, but Main {Instrument.FullName} position still open!", AlertPriority.High);
-					Print($"[MirrorTradeStrategy] DESYNC: Mirror position closed, Main position still open");
-				}
-			}
-			catch (Exception ex)
-			{
-				Print($"[MirrorTradeStrategy] Error checking desync alerts: {ex.Message}");
-			}
-		}
+                _statusText = new TextBlock
+                {
+                    Foreground = Brushes.White,
+                    FontSize = 12,
+                    Margin = new Thickness(5)
+                };
 
-		private void UpdateStatusDisplay(Position mainPos, Position mirrorPos)
-		{
-			try
-			{
-				if (_statusText != null)
-				{
-					string status = $"Mirror Copy: {(EnableCopy ? "ON" : "OFF")}\n" +
-								   $"Main: {Instrument.FullName}\n" +
-								   $"  Qty: {mainPos.Quantity} | Avg: {mainPos.AveragePrice:0.00} | PnL: ${mainPos.GetUnrealizedProfitLoss(PerformanceUnit.Currency, Close[0]):0.00}\n" +
-								   $"Mirror: {_mirrorInstrument.FullName}\n" +
-								   $"  Qty: {mirrorPos.Quantity} | Avg: {mirrorPos.AveragePrice:0.00} | PnL: ${mirrorPos.GetUnrealizedProfitLoss(PerformanceUnit.Currency, Closes[_mirrorBarsInProgress][0]):0.00}";
-					
-					_statusText.Text = status;
-				}
-				
-				// Also draw on chart for backup
-				string chartStatus = $"Mirror: {(EnableCopy ? "ON" : "OFF")} | Main: {mainPos.Quantity} | Mirror: {mirrorPos.Quantity}";
-				Draw.TextFixed(this, "MirrorStatus", chartStatus, TextPosition.TopLeft, Brushes.White, 
-					new Gui.Tools.SimpleFont("Arial", 12), Brushes.Transparent, Brushes.Transparent, 0);
-			}
-			catch (Exception ex)
-			{
-				Print($"[MirrorTradeStrategy] Error updating status display: {ex.Message}");
-			}
-		}
-	}
+                if (ChartControl != null)
+                {
+                    ChartControl.Dispatcher.InvokeAsync(() =>
+                    {
+                        var panel = new StackPanel
+                        {
+                            Orientation = Orientation.Vertical,
+                            Background = new SolidColorBrush(Color.FromArgb(150, 0, 0, 0)),
+                            Margin = new Thickness(10)
+                        };
+                        panel.Children.Add(_toggleButton);
+                        panel.Children.Add(_statusText);
+                        ChartControl.CustomControls.Add(panel);
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Print($"[MirrorTradeStrategy] UI error: {ex.Message}");
+            }
+        }
+
+        private void ToggleButton_Click(object sender, RoutedEventArgs e)
+        {
+            EnableCopy = !EnableCopy;
+            _toggleButton.Content = EnableCopy ? "DISABLE MIRROR" : "ENABLE MIRROR";
+            _toggleButton.Background = EnableCopy ? Brushes.Red : Brushes.Green;
+            Print($"[MirrorTradeStrategy] Mirror {(EnableCopy ? "ENABLED" : "DISABLED")}");
+        }
+
+        private void UpdateStatusDisplay(Position mainPos, Position mirrorPos)
+        {
+            try
+            {
+                string msg =
+                    $"Mirror Copy: {(EnableCopy ? "ON" : "OFF")}\n" +
+                    $"Main: {Instrument.FullName} | Qty: {mainPos.Quantity} | PnL: {mainPos.GetUnrealizedProfitLoss(PerformanceUnit.Currency, Close[0]):C2}\n" +
+                    $"Mirror: {_mirrorInstrument.FullName} | Qty: {(mirrorPos != null ? mirrorPos.Quantity : 0)} | " +
+                    $"PnL: {(mirrorPos != null ? mirrorPos.GetUnrealizedProfitLoss(PerformanceUnit.Currency, Closes[_mirrorBarsInProgress][0]).ToString("C2") : "$0.00")}";
+
+                if (_statusText != null)
+                    _statusText.Text = msg;
+
+                Draw.TextFixed(this, "MirrorStatus", msg, TextPosition.TopLeft, Brushes.White, new SimpleFont("Arial", 12), Brushes.Transparent, Brushes.Transparent, 0);
+            }
+            catch (Exception ex)
+            {
+                Print($"[MirrorTradeStrategy] Status error: {ex.Message}");
+            }
+        }
+
+        private void ShowAlert(string id, string message, Brush background, Brush foreground)
+        {
+            Alert(id, Priority.High, message, new SimpleFont("Arial", 12, FontStyle.Bold), background, foreground);
+        }
+
+        #endregion
+    }
 }
-
-
