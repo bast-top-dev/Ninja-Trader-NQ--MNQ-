@@ -515,8 +515,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         
         private (double tpPrice, double slPrice, int tpTicks, int slTicks) CalculateMirrorSLTP(MirrorInstrument mirror, int mirrorQty)
         {
-            // Get current price for mirror instrument
-            double entryPrice = Close[mirror.BarsInProgress];
+            // Use main instrument's current price as entry price for mirror
+            double entryPrice = Close[0]; // Use main instrument's current price
             
             // Calculate tick value for mirror instrument
             double tickValue = mirror.Instrument.MasterInstrument.PointValue * mirror.Instrument.MasterInstrument.TickSize;
@@ -557,7 +557,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             int tpTicks = DollarsToTicks(mirrorTPDollars, tickValue, mirrorQty);
             int slTicks = DollarsToTicks(mirrorSLDollars, tickValue, mirrorQty);
             
-            // Calculate prices
+            // Calculate prices - use main instrument's price as entry price
             double tpPrice = entryPrice + tpTicks * mirror.Instrument.MasterInstrument.TickSize;
             double slPrice = entryPrice - slTicks * mirror.Instrument.MasterInstrument.TickSize;
             
