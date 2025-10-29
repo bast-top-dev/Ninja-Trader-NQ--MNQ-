@@ -86,6 +86,54 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Description("Contract multiplier for third mirror instrument")]
         public int MirrorMultiplier3 { get; set; } = 1;
 
+        [NinjaScriptProperty]
+        [Description("Fourth mirror instrument")]
+        public string MirrorInstrument4 { get; set; } = "";
+        
+        [NinjaScriptProperty]
+        [Description("Account for fourth mirror instrument")]
+        public string MirrorAccount4 { get; set; } = "";
+        
+        [NinjaScriptProperty]
+        [Description("Direction for fourth mirror instrument")]
+        public MirrorDirection MirrorDirection4 { get; set; } = MirrorDirection.Opposite;
+        
+        [NinjaScriptProperty]
+        [Description("Contract multiplier for fourth mirror instrument")]
+        public int MirrorMultiplier4 { get; set; } = 1;
+
+        [NinjaScriptProperty]
+        [Description("Fifth mirror instrument")]
+        public string MirrorInstrument5 { get; set; } = "";
+        
+        [NinjaScriptProperty]
+        [Description("Account for fifth mirror instrument")]
+        public string MirrorAccount5 { get; set; } = "";
+        
+        [NinjaScriptProperty]
+        [Description("Direction for fifth mirror instrument")]
+        public MirrorDirection MirrorDirection5 { get; set; } = MirrorDirection.Opposite;
+        
+        [NinjaScriptProperty]
+        [Description("Contract multiplier for fifth mirror instrument")]
+        public int MirrorMultiplier5 { get; set; } = 1;
+
+        [NinjaScriptProperty]
+        [Description("Sixth mirror instrument")]
+        public string MirrorInstrument6 { get; set; } = "";
+        
+        [NinjaScriptProperty]
+        [Description("Account for sixth mirror instrument")]
+        public string MirrorAccount6 { get; set; } = "";
+        
+        [NinjaScriptProperty]
+        [Description("Direction for sixth mirror instrument")]
+        public MirrorDirection MirrorDirection6 { get; set; } = MirrorDirection.Opposite;
+        
+        [NinjaScriptProperty]
+        [Description("Contract multiplier for sixth mirror instrument")]
+        public int MirrorMultiplier6 { get; set; } = 1;
+
         // Global Settings
         [NinjaScriptProperty]
         [Description("Enable/disable trade copying")]
@@ -98,6 +146,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Description("Alert when positions close independently")]
         public bool AlertOnUnsynchronizedClose { get; set; } = true;
+
+        // Action toggles
+        [NinjaScriptProperty]
+        [Description("Request to close ALL positions (main + mirrors). Set true to execute once.")]
+        public bool RequestCloseAll { get; set; } = false;
+
+        [NinjaScriptProperty]
+        [Description("Request to close only MIRROR positions. Set true to execute once.")]
+        public bool RequestCloseGroup { get; set; } = false;
 
         #endregion
 
@@ -172,12 +229,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Initialize mirror instruments
                 InitializeMirrorInstruments();
                 
-                // Add data series for each mirror instrument
+                // Add data series for each mirror instrument (use full instrument name with expiry)
                 foreach (var mirror in mirrorInstruments.Where(m => m.IsActive))
                 {
                     try
                     {
-                        AddDataSeries(mirror.Instrument.MasterInstrument.Name, BarsPeriod.BarsPeriodType, BarsPeriod.Value);
+                        AddDataSeries(mirror.Name, BarsPeriod.BarsPeriodType, BarsPeriod.Value);
                     }
                     catch (Exception ex)
                     {
@@ -225,6 +282,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             AddMirrorInstrument(MirrorInstrument1, MirrorAccount1, MirrorDirection1, MirrorMultiplier1);
             AddMirrorInstrument(MirrorInstrument2, MirrorAccount2, MirrorDirection2, MirrorMultiplier2);
             AddMirrorInstrument(MirrorInstrument3, MirrorAccount3, MirrorDirection3, MirrorMultiplier3);
+            AddMirrorInstrument(MirrorInstrument4, MirrorAccount4, MirrorDirection4, MirrorMultiplier4);
+            AddMirrorInstrument(MirrorInstrument5, MirrorAccount5, MirrorDirection5, MirrorMultiplier5);
+            AddMirrorInstrument(MirrorInstrument6, MirrorAccount6, MirrorDirection6, MirrorMultiplier6);
             
             Print($"[MirrorTradeStrategy] Initialized {mirrorInstruments.Count(m => m.IsActive)} mirror instruments");
         }
@@ -263,7 +323,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 for (int i = 0; i < BarsArray.Length; i++)
                 {
-                    if (BarsArray[i].Instrument.MasterInstrument.Name == mirror.Instrument.MasterInstrument.Name)
+                    if (BarsArray[i].Instrument != null && BarsArray[i].Instrument.FullName == mirror.Name)
                     {
                         mirror.BarsInProgress = i;
                         Print($"[MirrorTradeStrategy] Mapped {mirror.Name} to BarsInProgress[{i}]");
@@ -333,6 +393,24 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (!EnableCopy)
                 return;
+
+            // One-shot actionable toggles
+            if (RequestCloseAll)
+            {
+                Print("[MirrorTradeStrategy] RequestCloseAll received. Closing all positions (main + mirrors)...");
+                TryCloseMainPosition();
+                foreach (var mirror in mirrorInstruments.Where(m => m.IsActive))
+                    TryCloseMirrorPosition(mirror);
+                RequestCloseAll = false; // reset
+            }
+
+            if (RequestCloseGroup)
+            {
+                Print("[MirrorTradeStrategy] RequestCloseGroup received. Closing mirror positions only...");
+                foreach (var mirror in mirrorInstruments.Where(m => m.IsActive))
+                    TryCloseMirrorPosition(mirror);
+                RequestCloseGroup = false; // reset
+            }
 
             // Monitor positions for synchronized closing alerts
             MonitorPositions();
@@ -436,6 +514,70 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (e.Execution.Order?.OrderState != OrderState.Filled)
                     return;
 
+                // If this is the mirror ENTRY fill, place the protective TP/SL using the fill price
+                if (e.Execution.Order != null && e.Execution.Order.Name != null && e.Execution.Order.Name.StartsWith("MirrorEntry_"))
+                {
+                    var qty = Math.Abs(e.Execution.Quantity);
+                    if (qty <= 0) return;
+
+                    // Compute mirror TP/SL dollars with inversion logic
+                    double mainSLDollars, mainTPDollars;
+                    if (MainSLTPMethod == SLTPInputMethod.Dollars)
+                    {
+                        mainSLDollars = MainStopLossDollars;
+                        mainTPDollars = MainTakeProfitDollars;
+                    }
+                    else
+                    {
+                        double mainTickValue = Instrument.MasterInstrument.PointValue * Instrument.MasterInstrument.TickSize;
+                        mainSLDollars = MainStopLossTicks * mainTickValue;
+                        mainTPDollars = MainTakeProfitTicks * mainTickValue;
+                    }
+
+                    double mirrorTPDollars, mirrorSLDollars;
+                    if (mirror.Direction == MirrorDirection.Opposite)
+                    {
+                        mirrorTPDollars = mainSLDollars;
+                        mirrorSLDollars = mainTPDollars;
+                    }
+                    else
+                    {
+                        mirrorTPDollars = mainTPDollars;
+                        mirrorSLDollars = mainSLDollars;
+                    }
+
+                    // Dollars-to-ticks using mirror instrument economics
+                    double tickValue = mirror.Instrument.MasterInstrument.PointValue * mirror.Instrument.MasterInstrument.TickSize;
+                    int tpTicks = DollarsToTicks(mirrorTPDollars, tickValue, qty);
+                    int slTicks = DollarsToTicks(mirrorSLDollars, tickValue, qty);
+
+                    double tickSize = mirror.Instrument.MasterInstrument.TickSize;
+                    double fillPrice = e.Execution.Price;
+
+                    string ocoId = Guid.NewGuid().ToString("N").Substring(0, 10);
+
+                    if (e.Execution.MarketPosition == MarketPosition.Long)
+                    {
+                        // Long: TP above, SL below
+                        double tpPrice = fillPrice + tpTicks * tickSize;
+                        double slPrice = fillPrice - slTicks * tickSize;
+
+                        SubmitOrderUnmanaged(mirror.BarsInProgress, OrderAction.Sell, OrderType.Limit, qty, tpPrice, 0, ocoId, $"TP_{mirror.Name}_{ocoId}");
+                        SubmitOrderUnmanaged(mirror.BarsInProgress, OrderAction.Sell, OrderType.StopMarket, qty, 0, slPrice, ocoId, $"SL_{mirror.Name}_{ocoId}");
+                    }
+                    else if (e.Execution.MarketPosition == MarketPosition.Short)
+                    {
+                        // Short: TP below, SL above
+                        double tpPrice = fillPrice - tpTicks * tickSize;
+                        double slPrice = fillPrice + slTicks * tickSize;
+
+                        SubmitOrderUnmanaged(mirror.BarsInProgress, OrderAction.BuyToCover, OrderType.Limit, qty, tpPrice, 0, ocoId, $"TP_{mirror.Name}_{ocoId}");
+                        SubmitOrderUnmanaged(mirror.BarsInProgress, OrderAction.BuyToCover, OrderType.StopMarket, qty, 0, slPrice, ocoId, $"SL_{mirror.Name}_{ocoId}");
+                    }
+
+                    Print($"[MirrorTradeStrategy] Mirror bracket placed on fill {e.Execution.MarketPosition} qty={qty}, TP={tpTicks} ticks, SL={slTicks} ticks, OCO={ocoId}");
+                }
+
                 Print($"[MirrorTradeStrategy] Mirror execution on {mirror.Name}: {e.Execution.MarketPosition} {Math.Abs(e.Execution.Quantity)}");
             }
             catch (Exception ex)
@@ -462,11 +604,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Close existing position on mirror instrument
                 CloseExistingMirrorPosition(mirror);
 
-                // Calculate SL/TP values with proper inversion for face-to-face trading
-                var sltpValues = CalculateMirrorSLTP(mirror, mirrorQty);
-
-                // Create OCO orders
-                CreateMirrorOCOOrders(mirror, mirrorAction, mirrorQty, sltpValues);
+                // Submit only the ENTRY; TP/SL will be submitted on mirror fill in OnMirrorAccountExecutionUpdate
+                string ocoId = Guid.NewGuid().ToString("N").Substring(0, 10);
+                string entrySignal = $"MirrorEntry_{mirror.Name}_{ocoId}";
+                SubmitOrderUnmanaged(mirror.BarsInProgress, mirrorAction, OrderType.Market, mirrorQty, 0, 0, ocoId, entrySignal);
 
                 Print($"[MirrorTradeStrategy] Created mirror trade: {mirrorAction} {mirrorQty} {mirror.Name} on {mirror.AccountName}");
             }
@@ -510,6 +651,50 @@ namespace NinjaTrader.NinjaScript.Strategies
             catch (Exception ex)
             {
                 Print($"[MirrorTradeStrategy] Error closing existing position on {mirror.Name}: {ex.Message}");
+            }
+        }
+
+        private void TryCloseMirrorPosition(MirrorInstrument mirror)
+        {
+            try
+            {
+                var pos = GetMirrorPosition(mirror);
+                if (pos.MarketPosition == MarketPosition.Long)
+                {
+                    Print($"[MirrorTradeStrategy] CloseGroup -> Closing LONG on {mirror.Name} ({mirror.AccountName})");
+                    SubmitOrderUnmanaged(mirror.BarsInProgress, OrderAction.Sell, OrderType.Market, pos.Quantity, 0, 0, "", "CloseGroup_Long_" + mirror.Name);
+                }
+                else if (pos.MarketPosition == MarketPosition.Short)
+                {
+                    Print($"[MirrorTradeStrategy] CloseGroup -> Closing SHORT on {mirror.Name} ({mirror.AccountName})");
+                    SubmitOrderUnmanaged(mirror.BarsInProgress, OrderAction.BuyToCover, OrderType.Market, Math.Abs(pos.Quantity), 0, 0, "", "CloseGroup_Short_" + mirror.Name);
+                }
+            }
+            catch (Exception ex)
+            {
+                Print($"[MirrorTradeStrategy] Error in TryCloseMirrorPosition for {mirror.Name}: {ex.Message}");
+            }
+        }
+
+        private void TryCloseMainPosition()
+        {
+            try
+            {
+                var pos = GetMainPosition();
+                if (pos.MarketPosition == MarketPosition.Long)
+                {
+                    Print("[MirrorTradeStrategy] CloseAll -> Closing LONG on main instrument");
+                    ExitLong();
+                }
+                else if (pos.MarketPosition == MarketPosition.Short)
+                {
+                    Print("[MirrorTradeStrategy] CloseAll -> Closing SHORT on main instrument");
+                    ExitShort();
+                }
+            }
+            catch (Exception ex)
+            {
+                Print($"[MirrorTradeStrategy] Error in TryCloseMainPosition: {ex.Message}");
             }
         }
         
