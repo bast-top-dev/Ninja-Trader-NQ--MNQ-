@@ -183,6 +183,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private TimeSpan minInterval = TimeSpan.FromSeconds(1);
         private bool infoPanelCreated = false;
         private Dictionary<string, Position> lastKnownPositions = new Dictionary<string, Position>();
+        private string mainInstrumentRoot;
         
         #endregion
 
@@ -206,6 +207,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Direction = direction;
                 Multiplier = multiplier;
                 IsActive = !string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(accountName);
+                BarsInProgress = -1; // ensure we never default to primary series (0)
             }
         }
         
@@ -234,7 +236,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     try
                     {
-                        AddDataSeries(mirror.Name, BarsPeriod.BarsPeriodType, BarsPeriod.Value);
+                        // Use the resolved instrument's FullName to avoid month-format mismatches (e.g., "DEC25" vs "12-25")
+                        AddDataSeries(mirror.Instrument.FullName, BarsPeriod.BarsPeriodType, BarsPeriod.Value);
                     }
                     catch (Exception ex)
                     {
@@ -246,6 +249,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 // Map bars in progress for each mirror instrument
                 MapMirrorBarsInProgress();
+                // Capture the main/root instrument from the primary series
+                if (BarsArray.Length > 0 && BarsArray[0]?.Instrument?.MasterInstrument != null)
+                    mainInstrumentRoot = BarsArray[0].Instrument.MasterInstrument.Name;
+                Print($"[MirrorTradeStrategy] Primary series root: {mainInstrumentRoot}");
             }
             else if (State == State.Realtime)
             {
@@ -323,12 +330,28 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 for (int i = 0; i < BarsArray.Length; i++)
                 {
-                    if (BarsArray[i].Instrument != null && BarsArray[i].Instrument.FullName == mirror.Name)
+                    var bi = BarsArray[i].Instrument;
+                    if (bi == null) continue;
+                    // Match on instrument root + expiry to avoid FullName formatting differences
+                    bool sameRoot = bi.MasterInstrument.Name == mirror.Instrument.MasterInstrument.Name;
+                    bool sameExpiry = bi.Expiry == mirror.Instrument.Expiry;
+                    if (sameRoot && sameExpiry)
                     {
                         mirror.BarsInProgress = i;
-                        Print($"[MirrorTradeStrategy] Mapped {mirror.Name} to BarsInProgress[{i}]");
+                        Print($"[MirrorTradeStrategy] Mapped {bi.FullName} to BarsInProgress[{i}]");
                         break;
                     }
+                }
+                if (mirror.BarsInProgress < 1)
+                {
+                    // Dump what we have to help diagnose
+                    for (int j = 0; j < BarsArray.Length; j++)
+                    {
+                        var bj = BarsArray[j].Instrument;
+                        if (bj != null)
+                            Print($"[MirrorTradeStrategy] DEBUG Series[{j}] = {bj.FullName} Expiry={bj.Expiry}");
+                    }
+                    Print($"[MirrorTradeStrategy] WARNING: Could not map mirror series for {mirror.Instrument.FullName}. Expiry={mirror.Instrument.Expiry}");
                 }
             }
         }
@@ -463,20 +486,39 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             try
             {
+                // Debug logging
+                Print($"[MirrorTradeStrategy] Execution event received: EnableCopy={EnableCopy}, Execution={e?.Execution != null}, Instrument={e?.Execution?.Instrument?.MasterInstrument?.Name}, OrderState={e?.Execution?.Order?.OrderState}");
+                
                 if (!EnableCopy || e?.Execution == null)
+                {
+                    if (!EnableCopy)
+                        Print("[MirrorTradeStrategy] DEBUG: EnableCopy is FALSE - mirror trades disabled");
                     return;
+                }
 
-                // Only process orders on the main instrument
-                if (e.Execution.Instrument.MasterInstrument.Name != Instrument.MasterInstrument.Name)
+                // Only process orders for the configured main/root instrument (derive from primary series)
+                var execRoot = e.Execution.Instrument.MasterInstrument.Name;
+                if (string.IsNullOrEmpty(mainInstrumentRoot))
+                    mainInstrumentRoot = BarsArray[0]?.Instrument?.MasterInstrument?.Name;
+                if (!string.Equals(execRoot, mainInstrumentRoot, StringComparison.OrdinalIgnoreCase))
+                {
+                    Print($"[MirrorTradeStrategy] DEBUG: Skipping execution - instrument mismatch. Execution={execRoot}, MainRoot={mainInstrumentRoot}");
                     return;
+                }
 
                 // Only process filled orders
                 if (e.Execution.Order?.OrderState != OrderState.Filled)
+                {
+                    Print($"[MirrorTradeStrategy] DEBUG: Skipping execution - not filled. OrderState={e.Execution.Order?.OrderState}");
                     return;
+                }
 
                 // Rate limiting
                 if (DateTime.UtcNow - lastActionTime < minInterval)
+                {
+                    Print("[MirrorTradeStrategy] DEBUG: Skipping execution - rate limiting");
                     return;
+                }
 
                 lastActionTime = DateTime.UtcNow;
 
@@ -491,6 +533,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             catch (Exception ex)
             {
                 Print($"[MirrorTradeStrategy] Error in main account execution update: {ex.Message}");
+                Print($"[MirrorTradeStrategy] Stack trace: {ex.StackTrace}");
             }
         }
         
@@ -513,6 +556,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Only process filled orders
                 if (e.Execution.Order?.OrderState != OrderState.Filled)
                     return;
+
+                if (mirror.BarsInProgress < 1)
+                {
+                    Print($"[MirrorTradeStrategy] WARNING: Mirror {mirror.Name} not mapped yet for bracket (BarsInProgress={mirror.BarsInProgress}). Skipping TP/SL.");
+                    return;
+                }
 
                 // If this is the mirror ENTRY fill, place the protective TP/SL using the fill price
                 if (e.Execution.Order != null && e.Execution.Order.Name != null && e.Execution.Order.Name.StartsWith("MirrorEntry_"))
@@ -594,6 +643,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             try
             {
+                if (mirror.BarsInProgress < 1)
+                {
+                    Print($"[MirrorTradeStrategy] WARNING: Mirror {mirror.Name} not mapped yet (BarsInProgress={mirror.BarsInProgress}). Skipping entry.");
+                    return;
+                }
                 // Calculate mirror quantity
                 int mainQty = Math.Abs(execution.Quantity);
                 int mirrorQty = Math.Max(1, mirror.Multiplier * mainQty);
@@ -633,6 +687,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             try
             {
+                if (mirror.BarsInProgress < 1)
+                {
+                    Print($"[MirrorTradeStrategy] WARNING: Mirror {mirror.Name} not mapped yet (BarsInProgress={mirror.BarsInProgress}). Skip close.");
+                    return;
+                }
                 var existingPos = GetMirrorPosition(mirror);
                 if (existingPos.MarketPosition != MarketPosition.Flat)
                 {
@@ -658,6 +717,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             try
             {
+                if (mirror.BarsInProgress < 1)
+                {
+                    Print($"[MirrorTradeStrategy] WARNING: Mirror {mirror.Name} not mapped yet (BarsInProgress={mirror.BarsInProgress}). Skip TryClose.");
+                    return;
+                }
                 var pos = GetMirrorPosition(mirror);
                 if (pos.MarketPosition == MarketPosition.Long)
                 {
