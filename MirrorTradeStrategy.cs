@@ -358,6 +358,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         
         private void InitializeAccounts()
         {
+            Print("[MirrorTradeStrategy] DEBUG: Available accounts at init:");
+            foreach (var acct in Account.All)
+                Print($"[MirrorTradeStrategy] DEBUG Account: '{acct.Name}'");
+
             // Initialize main account
             mainAccount = Account.All.FirstOrDefault(a => a.Name == MainAccountName);
             if (mainAccount == null)
@@ -372,19 +376,28 @@ namespace NinjaTrader.NinjaScript.Strategies
                 mirror.Account = Account.All.FirstOrDefault(a => a.Name == mirror.AccountName);
                 if (mirror.Account == null)
                 {
-                    Print($"Warning: Mirror account '{mirror.AccountName}' not found for {mirror.Name}");
+                    Print($"[MirrorTradeStrategy] ERROR: Mirror account '{mirror.AccountName}' not found in Account.All! This must EXACTLY match the Control Center account name. Mirror for {mirror.Name} will not be active.");
                     mirror.IsActive = false;
+                }
+                else if (mirror.AccountName == MainAccountName)
+                {
+                    Print($"[MirrorTradeStrategy] ERROR: Mirror account '{mirror.AccountName}' is the SAME as the main account! Mirror will be skipped for {mirror.Name}.");
+                    mirror.IsActive = false;
+                }
+                else
+                {
+                    Print($"[MirrorTradeStrategy] Mirror instrument {mirror.Name} using account '{mirror.AccountName}' initialized OK.");
                 }
             }
             
-            // Subscribe to execution updates for main account
+            // Subscribe to execution updates for main account (to detect main trades)
             if (mainAccount != null)
             {
                 mainAccount.ExecutionUpdate += OnMainAccountExecutionUpdate;
                 Print($"[MirrorTradeStrategy] Subscribed to main account: {mainAccount.Name}");
             }
             
-            // Subscribe to execution updates for mirror accounts
+            // Subscribe to execution updates for mirror accounts (to detect when mirror entry fills and place TP/SL)
             foreach (var mirror in mirrorInstruments.Where(m => m.IsActive && m.Account != null))
             {
                 mirror.Account.ExecutionUpdate += OnMirrorAccountExecutionUpdate;
@@ -399,6 +412,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 mainAccount.ExecutionUpdate -= OnMainAccountExecutionUpdate;
             }
             
+            // Unsubscribe from mirror accounts
             foreach (var mirror in mirrorInstruments.Where(m => m.IsActive && m.Account != null))
             {
                 mirror.Account.ExecutionUpdate -= OnMirrorAccountExecutionUpdate;
@@ -496,7 +510,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return;
                 }
 
-                // Only process orders for the configured main/root instrument (derive from primary series)
+                // Only process orders on the main/root instrument (primary series detected at DataLoaded)
                 var execRoot = e.Execution.Instrument.MasterInstrument.Name;
                 if (string.IsNullOrEmpty(mainInstrumentRoot))
                     mainInstrumentRoot = BarsArray[0]?.Instrument?.MasterInstrument?.Name;
@@ -505,15 +519,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Print($"[MirrorTradeStrategy] DEBUG: Skipping execution - instrument mismatch. Execution={execRoot}, MainRoot={mainInstrumentRoot}");
                     return;
                 }
-
+                
                 // Only process filled orders
                 if (e.Execution.Order?.OrderState != OrderState.Filled)
                 {
                     Print($"[MirrorTradeStrategy] DEBUG: Skipping execution - not filled. OrderState={e.Execution.Order?.OrderState}");
                     return;
                 }
-
-                // Rate limiting
                 if (DateTime.UtcNow - lastActionTime < minInterval)
                 {
                     Print("[MirrorTradeStrategy] DEBUG: Skipping execution - rate limiting");
@@ -521,11 +533,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
 
                 lastActionTime = DateTime.UtcNow;
-
                 Print($"[MirrorTradeStrategy] Main account execution detected: {e.Execution.MarketPosition} {Math.Abs(e.Execution.Quantity)} {e.Execution.Instrument.MasterInstrument.Name}");
 
-                // Create mirror trades for each active mirror instrument
-                foreach (var mirror in mirrorInstruments.Where(m => m.IsActive))
+                // Only create mirror trades on different accounts
+                foreach (var mirror in mirrorInstruments.Where(m => m.IsActive && m.Account != null && m.Account.Name != mainAccount.Name))
                 {
                     CreateMirrorTrade(e.Execution, mirror);
                 }
@@ -536,7 +547,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print($"[MirrorTradeStrategy] Stack trace: {ex.StackTrace}");
             }
         }
-        
+
         private void OnMirrorAccountExecutionUpdate(object sender, ExecutionEventArgs e)
         {
             try
@@ -605,6 +616,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                     string ocoId = Guid.NewGuid().ToString("N").Substring(0, 10);
 
+                    // Submit TP/SL orders (will go to strategy's account context)
+                    // Note: For true cross-account, use a trade copier add-on
                     if (e.Execution.MarketPosition == MarketPosition.Long)
                     {
                         // Long: TP above, SL below
@@ -661,6 +674,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Submit only the ENTRY; TP/SL will be submitted on mirror fill in OnMirrorAccountExecutionUpdate
                 string ocoId = Guid.NewGuid().ToString("N").Substring(0, 10);
                 string entrySignal = $"MirrorEntry_{mirror.Name}_{ocoId}";
+                
+                // IMPORTANT: NinjaScript strategies cannot submit orders to different accounts.
+                // Orders will be placed in the account where the strategy is running.
+                // For true cross-account mirroring, you MUST use a trade copier add-on.
+                // This code will place orders in the strategy's account context.
+                Print($"[MirrorTradeStrategy] WARNING: Strategy can only place orders in its own account context. For cross-account mirroring to {mirror.AccountName}, use a trade copier add-on.");
                 SubmitOrderUnmanaged(mirror.BarsInProgress, mirrorAction, OrderType.Market, mirrorQty, 0, 0, ocoId, entrySignal);
 
                 Print($"[MirrorTradeStrategy] Created mirror trade: {mirrorAction} {mirrorQty} {mirror.Name} on {mirror.AccountName}");
